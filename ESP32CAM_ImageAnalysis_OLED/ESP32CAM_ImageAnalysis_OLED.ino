@@ -33,10 +33,10 @@ const char* ssid = "SSID";
 const char* password = "PASS";
 
 // OpenAI API key
-const String apiKey = "YOUR API KEY";
+const String apiKey = "API KEY";
 
 // Question to be Asked about the image
-String Question = "Just let me know only the number of the car";
+String Question = "Summarize the image";
 
 // OLED display settings
 #define SCREEN_WIDTH 128
@@ -140,7 +140,10 @@ void displayCenteredText(const String& text, int textSize = 1) {
 
   display.display();
 }
-
+// Function to encode image to Base64
+String encodeImageToBase64(const uint8_t* imageData, size_t imageSize) {
+  return base64::encode(imageData, imageSize);
+}
 void setup() {
   Serial.begin(115200);
   WiFi.begin(ssid, password);
@@ -156,7 +159,7 @@ void setup() {
   }
 
   // Display the project title on power-on
-  displayCenteredText("AI VISION Project\nby techiesms", 2);
+  displayCenteredText("AI VISION Project\nby techiesms", 1);
   delay(3000);  // Hold the title screen for 3 seconds
 
   displayCenteredText("Connecting to WiFi...");
@@ -205,6 +208,177 @@ void setup() {
   displayCenteredText("Press button to capture");
 }
 
+
+void captureAndAnalyzeImage() {
+  Serial.println("Capturing image...");
+
+  // Capture the image frame buffer
+  camera_fb_t* fb = esp_camera_fb_get();  // Get the frame buffer
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    displayCenteredText("Capture Failed");
+    return;
+  }
+
+  // After the new frame is obtained, ensure the buffer is returned (cleared)
+  esp_camera_fb_return(fb);  // Release the frame buffer from the previous capture
+
+  // Now, capture the new image
+  fb = esp_camera_fb_get();  // Get the frame buffer again for the new image
+
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    displayCenteredText("Capture Failed");
+    return;
+  }
+
+  Serial.println("Image captured");
+  String base64Image = encodeImageToBase64(fb->buf, fb->len);
+
+  beep();
+  // Return the frame buffer after processing the image
+  esp_camera_fb_return(fb);  // Return the frame buffer to free memory
+
+  if (base64Image.isEmpty()) {
+    Serial.println("Failed to encode the image!");
+    displayCenteredText("Encode Failed");
+    return;
+  }
+  // Send the image to OpenAI for analysis
+  AnalyzeImage(base64Image);
+}
+
+void AnalyzeImage(const String& base64Image) {
+  Serial.println("Sending image for analysis...");
+  displayCenteredText("Processing...");
+
+  String result;
+
+  // Prepare the payload for the OpenAI API
+  String url = "data:image/jpeg;base64," + base64Image;
+  Serial.println(url);
+
+  DynamicJsonDocument doc(4096);
+  doc["model"] = "gpt-4o";
+  JsonArray messages = doc.createNestedArray("messages");
+  JsonObject message = messages.createNestedObject();
+  message["role"] = "user";
+  JsonArray content = message.createNestedArray("content");
+  JsonObject textContent = content.createNestedObject();
+  textContent["type"] = "text";
+  textContent["text"] = "Summarize the context of this image?";
+
+  JsonObject imageContent = content.createNestedObject();
+  imageContent["type"] = "image_url";
+  JsonObject imageUrlObject = imageContent.createNestedObject("image_url");
+  imageUrlObject["url"] = url;
+  imageContent["image_url"]["detail"] = "auto";
+
+  doc["max_tokens"] = 400;
+
+  String jsonPayload;
+  serializeJson(doc, jsonPayload);
+
+  // Send request and validate response
+  if (sendPostRequest(jsonPayload, result)) {
+    Serial.print("[ChatGPT] Response: ");
+    Serial.println(result);
+
+    // Clear the display before showing the new response
+    display.clearDisplay();
+    display.display();
+
+    DynamicJsonDocument responseDoc(4096);
+    deserializeJson(responseDoc, result);
+
+    String responseContent = responseDoc["choices"][0]["message"]["content"].as<String>();
+    Serial.println("[ChatGPT] Parsed response: " + responseContent);
+
+    // Smooth scrolling and proper word wrapping
+    display.clearDisplay();
+    int lineHeight = 8;     // Height of each line in pixels
+    int maxLineChars = 21;  // Approx. max characters per line
+    int visibleLines = 7;
+    int scrollDelay = 2000;  // Delay for scrolling in milliseconds
+
+    std::vector<String> lines;  // Store formatted lines for display
+
+    // Split responseContent into words for word wrapping
+    String word = "";
+    String currentLine = "";
+
+    for (int i = 0; i < responseContent.length(); i++) {
+      char c = responseContent.charAt(i);
+      if (c == ' ' || c == '\n') {
+        if (currentLine.length() + word.length() <= maxLineChars) {
+          currentLine += (currentLine.isEmpty() ? "" : " ") + word;
+        } else {
+          lines.push_back(currentLine);
+          currentLine = word;
+        }
+        word = "";
+      } else {
+        word += c;
+      }
+    }
+    if (!currentLine.isEmpty()) lines.push_back(currentLine);
+    if (!word.isEmpty()) lines.push_back(word);
+
+    // Display lines with scrolling effect
+    for (size_t i = 0; i < lines.size(); i++) {
+      display.clearDisplay();
+      for (size_t j = 0; j < visibleLines && (i + j) < lines.size(); j++) {
+        display.setCursor(0, j * lineHeight);
+        display.print(lines[i + j]);
+      }
+      display.display();
+      delay(scrollDelay);
+    }
+
+    // Clear display after the response
+    display.clearDisplay();
+    display.display();
+
+    displayCenteredText("Press button to capture");
+  } else {
+    Serial.print("[ChatGPT] Error: ");
+    Serial.println(result);
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.print("API Error");
+    display.display();
+  }
+}
+
+bool sendPostRequest(const String& payload, String& result) {
+  HTTPClient http;
+  http.begin("https://api.openai.com/v1/chat/completions");
+
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", "Bearer " + apiKey);
+  http.setTimeout(20000);
+
+  Serial.print("Payload size: ");
+  Serial.println(payload.length());
+
+  int httpResponseCode = http.POST(payload);
+
+  if (httpResponseCode > 0) {
+    result = http.getString();
+    Serial.println("HTTP Response Code: " + String(httpResponseCode));
+    Serial.println("Response Body: " + result);
+    http.end();
+    return true;
+  } else {
+    result = "HTTP request failed, response code: " + String(httpResponseCode);
+    Serial.println("Error Code: " + String(httpResponseCode));
+    Serial.println("Error Message: " + http.errorToString(httpResponseCode));
+    http.end();
+    return false;
+  }
+}
+
+
 // Remaining code remains unchanged...
 
 void loop() {
@@ -214,4 +388,10 @@ void loop() {
     captureAndAnalyzeImage();
     delay(1000);  // Small delay to debounce button press
   }
+}
+void beep(){
+  digitalWrite(2,HIGH);
+  delay(300);
+  digitalWrite(2,LOW);
+  
 }
